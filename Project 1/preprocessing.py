@@ -17,11 +17,7 @@ def normalize_features(data):
     # Create a StandardScaler object
     scaler = StandardScaler()
 
-    # Fit the data set to the scaler object
-    scaler.fit(data)
-
-    # Normalize the data set
-    normalized_data = scaler.transform(data)
+    normalized_data = scaler.fit_transform(data)
 
     return normalized_data, scaler
 def detect_outliers_PCA_GMM(standardized_features, n_clusters=2, threshold_percentile=2.5):
@@ -33,10 +29,10 @@ def detect_outliers_PCA_GMM(standardized_features, n_clusters=2, threshold_perce
     :param threshold_percentile: The percentile to determine the threshold for outlier detection (default is 2.5).
     :return: A boolean array indicating which samples are outliers.
     """
-    pca = PCA(n_components=0.95)  # retain 95% of the variance
-    reduced_features = pca.fit(standardized_features)
+    pca = PCA(n_components=2)  # retain 95% of the variance
+    reduced_features = pca.fit_transform(standardized_features)
     # Check how many components were retained
-    print(f"Number of components retained: {pca.n_components_}")
+    # print(f"Number of components retained: {pca.n_components_}")
 
     gmm = GaussianMixture(n_components=n_clusters, covariance_type='full', random_state=42)
     gmm.fit(reduced_features)
@@ -123,7 +119,7 @@ def replace_NaN(data, n_neighbors=5):
 
     filled_data = imputer.fit_transform(data)
 
-    return pd.DataFrame(filled_data, columns=data.columns)
+    return filled_data, imputer
 
 
 if __name__ == "__main__":
