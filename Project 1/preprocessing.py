@@ -29,7 +29,7 @@ def detect_outliers_PCA_GMM(standardized_features, n_clusters=2, threshold_perce
     :param threshold_percentile: The percentile to determine the threshold for outlier detection (default is 2.5).
     :return: A boolean array indicating which samples are outliers.
     """
-    pca = PCA(n_components=2)  # retain 95% of the variance
+    pca = PCA(n_components=0.95)  # retain 95% of the variance
     reduced_features = pca.fit_transform(standardized_features)
     # Check how many components were retained
     # print(f"Number of components retained: {pca.n_components_}")
@@ -91,7 +91,7 @@ def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=
                     batch_size=batch_size,
                     shuffle=True,
                     validation_split=0.2,
-                    verbose=1)
+                    verbose=0)
 
     # Predict the features
     predicted_features = autoencoder.predict(standardized_features)
