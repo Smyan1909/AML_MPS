@@ -1,10 +1,10 @@
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
 from sklearn.ensemble import IsolationForest
-from sklearn.impute import KNNImputer
+from sklearn.impute import KNNImputer, SimpleImputer
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense
 from tensorflow.keras import regularizers
@@ -29,6 +29,11 @@ def detect_outliers_PCA_GMM(standardized_features, n_clusters=2, threshold_perce
     :param threshold_percentile: The percentile to determine the threshold for outlier detection (default is 2.5).
     :return: A boolean array indicating which samples are outliers.
     """
+
+    scaler = RobustScaler()
+
+    standardized_features = scaler.fit_transform(standardized_features)
+
     pca = PCA(n_components=0.95)  # retain 95% of the variance
     reduced_features = pca.fit_transform(standardized_features)
     # Check how many components were retained
@@ -52,6 +57,11 @@ def detect_outliers_IsolationForest(standardized_features, contamination=0.025):
     :param contamination: The amount of contamination of the data set (default is 0.01).
     :return: A boolean array indicating which samples are outliers.
     """
+
+    scaler = RobustScaler()
+
+    standardized_features = scaler.fit_transform(standardized_features)
+
     iso_forest = IsolationForest(contamination=contamination, random_state=42)
     iso_forest.fit(standardized_features)
 
@@ -70,6 +80,11 @@ def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=
     :param batch_size: The batch size for training (default is 128).
     :return: A boolean array indicating which samples are outliers.
     """
+
+    scaler = RobustScaler()
+
+    standardized_features = scaler.fit_transform(standardized_features)
+
     # Create an input layer
     input_layer = Input(shape=(standardized_features.shape[1],))
 
@@ -120,6 +135,20 @@ def replace_NaN(data, n_neighbors=5):
     filled_data = imputer.fit_transform(data)
 
     return filled_data, imputer
+
+
+def impute_median(data):
+    """
+    :param data:
+    :return: array filled with imputed data using median values
+    """
+
+    imputer = SimpleImputer(strategy="median")
+
+    filled_data = imputer.fit_transform(data)
+
+    return filled_data, imputer
+
 
 
 if __name__ == "__main__":
