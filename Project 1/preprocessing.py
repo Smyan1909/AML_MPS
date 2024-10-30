@@ -5,9 +5,11 @@ from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
 from sklearn.ensemble import IsolationForest
 from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.svm import OneClassSVM
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.layers import Input, Dense, Dropout
 from tensorflow.keras import regularizers
+from tensorflow.keras.callbacks import EarlyStopping
 def normalize_features(data):
     """
     Normalize the features of the data set
@@ -20,7 +22,7 @@ def normalize_features(data):
     normalized_data = scaler.fit_transform(data)
 
     return normalized_data, scaler
-def detect_outliers_PCA_GMM(standardized_features, n_clusters=2, threshold_percentile=2.5):
+def detect_outliers_PCA_GMM(standardized_features, n_components = 2, threshold_percentile=2.5):
     """
     Detect outliers in the dataset using PCA for dimensionality reduction and GMM for clustering.
 
@@ -34,12 +36,19 @@ def detect_outliers_PCA_GMM(standardized_features, n_clusters=2, threshold_perce
 
     standardized_features = scaler.fit_transform(standardized_features)
 
-    pca = PCA(n_components=0.95)  # retain 95% of the variance
+    pca = PCA(n_components=n_components)  # retain 95% of the variance
     reduced_features = pca.fit_transform(standardized_features)
     # Check how many components were retained
     # print(f"Number of components retained: {pca.n_components_}")
 
-    gmm = GaussianMixture(n_components=n_clusters, covariance_type='full', random_state=42)
+    bic_scores = []
+    for n in range(1, 6):
+        gmm = GaussianMixture(n_components=n, random_state=42)
+        gmm.fit(reduced_features)
+        bic_scores.append(gmm.bic(reduced_features))
+    optimal_clusters = np.argmin(bic_scores) + 1
+
+    gmm = GaussianMixture(n_components=optimal_clusters, covariance_type='full', random_state=42)
     gmm.fit(reduced_features)
 
     scores = gmm.score_samples(reduced_features)
@@ -49,6 +58,22 @@ def detect_outliers_PCA_GMM(standardized_features, n_clusters=2, threshold_perce
 
     return anomalies
 
+
+def detect_outliers_OneClassSVM(standardized_features, nu=0.01, kernel='rbf', gamma=0.1):
+    """
+    Detect outliers in the dataset using One-Class SVM.
+    :param standardized_features: The standardized features of the dataset.
+    :return: A boolean array indicating which samples are outliers.
+    """
+
+    scaler = RobustScaler()
+
+    standardized_features = scaler.fit_transform(standardized_features)
+
+    one_class_svm = OneClassSVM(nu=nu, kernel=kernel, gamma=gamma)
+    anomalies = one_class_svm.fit_predict(standardized_features) == -1
+
+    return anomalies
 
 def detect_outliers_IsolationForest(standardized_features, contamination=0.025):
     """
@@ -62,6 +87,7 @@ def detect_outliers_IsolationForest(standardized_features, contamination=0.025):
 
     standardized_features = scaler.fit_transform(standardized_features)
 
+
     iso_forest = IsolationForest(contamination=contamination, random_state=42)
     iso_forest.fit(standardized_features)
 
@@ -71,7 +97,7 @@ def detect_outliers_IsolationForest(standardized_features, contamination=0.025):
 
     return anomalies
 
-def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=50, batch_size=64):
+def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=100, batch_size=64):
     """
     Detect outliers in the dataset using Autoencoders.
     :param standardized_features: The standardized features of the dataset.
@@ -89,8 +115,8 @@ def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=
     input_layer = Input(shape=(standardized_features.shape[1],))
 
     # Create the encoder
-    encoded = Dense(encoding_dim, activation='relu', activity_regularizer=regularizers.l1(10e-5))(input_layer)
-
+    encoded = Dense(encoding_dim, activation='relu', activity_regularizer=regularizers.l1(10e-4))(input_layer)
+    encoded = Dropout(0.2)(encoded)
     # Create the decoder
     decoded = Dense(standardized_features.shape[1], activation='sigmoid')(encoded)
 
@@ -100,12 +126,15 @@ def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=
     # Compile the autoencoder
     autoencoder.compile(optimizer='adam', loss='mean_squared_error')
 
+    early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
     # Fit the autoencoder
     autoencoder.fit(standardized_features, standardized_features,
                     epochs=epochs,
                     batch_size=batch_size,
                     shuffle=True,
-                    validation_split=0.2,
+                    validation_split=0.3,
+                    callbacks=[early_stopping],
                     verbose=0)
 
     # Predict the features
@@ -115,7 +144,7 @@ def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=
     mse = np.mean(np.power(standardized_features - predicted_features, 2), axis=1)
 
     # Calculate the threshold
-    threshold = np.percentile(mse, 97.5)
+    threshold = np.percentile(mse, 95)
 
     # Detect the outliers
     anomalies = mse > threshold
