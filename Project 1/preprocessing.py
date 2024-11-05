@@ -4,6 +4,7 @@ from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
 from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
 from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.svm import OneClassSVM
 from tensorflow.keras.models import Model
@@ -70,12 +71,16 @@ def detect_outliers_OneClassSVM(standardized_features, nu=0.01, kernel='rbf', ga
 
     standardized_features = scaler.fit_transform(standardized_features)
 
+    imputer = SimpleImputer(strategy="median")
+
+    standardized_features = imputer.fit_transform(standardized_features)
+
     one_class_svm = OneClassSVM(nu=nu, kernel=kernel, gamma=gamma)
     anomalies = one_class_svm.fit_predict(standardized_features) == -1
 
     return anomalies
 
-def detect_outliers_IsolationForest(standardized_features, contamination=0.025):
+def detect_outliers_IsolationForest(standardized_features, n_estimators = 100, contamination=0.025):
     """
     Detect outliers in the dataset using Isolation Forest.
     :param standardized_features: The standardized features of the dataset.
@@ -87,15 +92,46 @@ def detect_outliers_IsolationForest(standardized_features, contamination=0.025):
 
     standardized_features = scaler.fit_transform(standardized_features)
 
+    imputer = SimpleImputer(strategy="median")
 
-    iso_forest = IsolationForest(contamination=contamination, random_state=42)
+    standardized_features = imputer.fit_transform(standardized_features)
+
+    pca = PCA(n_components=2)
+    standardized_features = pca.fit_transform(standardized_features)
+
+    iso_forest = IsolationForest(n_estimators=n_estimators, contamination=contamination, random_state=42)
     iso_forest.fit(standardized_features)
 
     predictions = iso_forest.predict(standardized_features)
 
-    anomalies = predictions == -1
+    anomalies = predictions <= 0
 
     return anomalies
+
+
+def detect_outliers_lof(data, n_neighbors=20, contamination=0.05):
+    """
+    Detect outliers in a dataset using Local Outlier Factor (LOF) and return a boolean mask.
+
+    Parameters:
+    - data: DataFrame or numpy array of input data.
+    - n_neighbors: Number of neighbors to use for LOF (default is 20).
+    - contamination: The proportion of outliers in the dataset (default is 0.05).
+
+    Returns:
+    - outlier_mask: Boolean mask where True indicates outliers, and False indicates inliers.
+    """
+
+    # Initialize Local Outlier Factor model
+    lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination=contamination)
+
+    # Fit the LOF model and predict outliers (-1 for outliers, 1 for inliers)
+    outlier_labels = lof.fit_predict(data)
+
+    # Convert outlier labels to a boolean mask (True for outliers, False for inliers)
+    outlier_mask = outlier_labels == -1
+
+    return outlier_mask
 
 def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=100, batch_size=64):
     """
@@ -110,6 +146,10 @@ def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=
     scaler = RobustScaler()
 
     standardized_features = scaler.fit_transform(standardized_features)
+
+    imputer = SimpleImputer(strategy="median")
+
+    standardized_features = imputer.fit_transform(standardized_features)
 
     # Create an input layer
     input_layer = Input(shape=(standardized_features.shape[1],))
@@ -144,7 +184,7 @@ def detect_outliers_Autoencoders(standardized_features, encoding_dim=32, epochs=
     mse = np.mean(np.power(standardized_features - predicted_features, 2), axis=1)
 
     # Calculate the threshold
-    threshold = np.percentile(mse, 95)
+    threshold = np.percentile(mse, 95)  # was 95
 
     # Detect the outliers
     anomalies = mse > threshold
