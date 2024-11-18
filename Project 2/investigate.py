@@ -1,10 +1,11 @@
 import biosppy.signals.ecg as ecg
 import numpy as np
+import matplotlib.pyplot as plt
 import pandas as pd
 from scipy.stats import entropy, skew, kurtosis, uniform, randint
 import scipy
 from scipy.signal import welch
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.feature_selection import SelectKBest, f_classif, VarianceThreshold
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
 from sklearn.naive_bayes import GaussianNB
@@ -14,6 +15,12 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
+from imblearn.over_sampling import BorderlineSMOTE
+from sklearn.impute import KNNImputer, SimpleImputer
+from scipy.signal import butter, filtfilt
+import antropy as ant
+import neurokit2 as nk
+import pywt
 
 sampling_rate = 300
 
@@ -28,18 +35,92 @@ def load_data():
     return X_train, y_train, X_test
 
 
-def plot_ecg(x1, y, x2):
+def plot_ecg(x1, index):
     # Plot the ECG signal
-    signal = x1.loc[0].dropna().to_numpy(dtype=np.float32)
+    signal = x1.loc[index].dropna().to_numpy(dtype=np.float32)
+
+    signal = bandpass_filter(signal, highcut=45)[180: -300]
+
+    if np.abs(np.min(signal)) > np.max(signal):
+        signal *= -1
     out = ecg.ecg(signal=signal, sampling_rate=sampling_rate, show=True)
-    # plt.plot(signal)
-    # plt.show()
+
+    plt.figure(2)
+    plt.plot(np.mean(out['templates'], axis=0))
+
+    print("Signal Length: ", len(np.mean(out['templates'], axis=0)))
+
+    plt.show()
+
+
+def bandpass_filter(signal, lowcut=0.5, highcut=40, order=4):
+    """
+    Apply a Butterworth bandpass filter to the signal.
+
+    Parameters:
+    - signal: 1D numpy array of the ECG signal.
+    - lowcut: Lower cutoff frequency (in Hz).
+    - highcut: Upper cutoff frequency (in Hz).
+    - sampling_rate: Sampling rate of the signal (in Hz).
+    - order: Order of the filter.
+
+    Returns:
+    - filtered_signal: The bandpass filtered signal.
+    """
+    nyquist = 0.5 * sampling_rate
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    filtered_signal = filtfilt(b, a, signal)
+    return filtered_signal
+def extract_autocorrelation(signal, max_lag=50):
+    """
+    Calculate the autocorrelation of a signal up to a specified lag.
+
+    Parameters:
+    - signal: 1D NumPy array representing the ECG signal.
+    - max_lag: Maximum number of lags to compute the autocorrelation for.
+
+    Returns:
+    - autocorr_features: A 1D NumPy array of autocorrelation values up to max_lag.
+    """
+    # Remove mean from the signal
+    signal = signal - np.mean(signal)
+
+    # Compute the full autocorrelation
+    autocorr_full = np.correlate(signal, signal, mode='full')
+
+    # Extract the second half (positive lags)
+    autocorr = autocorr_full[len(autocorr_full) // 2:]
+
+    # Normalize the autocorrelation
+    autocorr = autocorr / autocorr[0]
+
+    # Select only up to the specified maximum lag
+    autocorr_features = autocorr[:max_lag]
+
+    return autocorr_features
 
 def extract_features(signal):
     # Extract features from the ECG signal
     signal = signal.dropna().to_numpy(dtype=np.float32)
-    rpeaks = ecg.engzee_segmenter(signal=signal, sampling_rate=sampling_rate)['rpeaks']
-    beats = ecg.extract_heartbeats(signal=signal, rpeaks=rpeaks, sampling_rate=sampling_rate)['templates']
+
+    signal = bandpass_filter(signal, highcut=45)[180: -300]
+
+    if np.abs(np.min(signal)) > np.max(signal):
+        signal *= -1
+
+    ecg_out = ecg.ecg(signal=signal, sampling_rate=sampling_rate, show=False)
+    rpeaks = ecg_out['rpeaks']
+    beats = ecg_out['templates']
+    hr = ecg_out['heart_rate']
+
+    nk_signal, info = nk.ecg_process(ecg_out['filtered'], sampling_rate=sampling_rate)
+
+    q_pos = np.array(info['ECG_Q_Peaks'])
+    s_pos = np.array(info['ECG_S_Peaks'])
+    t_pos = np.array(info['ECG_T_Peaks'])
+
 
     mean_heartbeat, std_heartbeat, median_heartbeat = calculate_representative_heartbeats(beats)
 
@@ -49,13 +130,18 @@ def extract_features(signal):
 
     temporal_features = extract_temporal_features(signal)
     frequency_features = extract_frequency_features(signal, sampling_rate)
-    intervals = extract_intervals_from_heartbeat(mean_heartbeat, rpeaks, sampling_rate)
+    #intervals = extract_intervals_from_heartbeat(mean_heartbeat, rpeaks, sampling_rate)
+    intervals = extract_intervals_from_points(rpeaks, q_pos, s_pos, t_pos, sampling_rate)
 
-    features = np.hstack([temporal_features, frequency_features, mean_heartbeat_features, std_heartbeat_features, median_heartbeat_features, intervals])
+    hrv_features = compute_hrv_features(np.diff(rpeaks) / sampling_rate)
+
+    features = np.hstack([temporal_features, frequency_features, mean_heartbeat_features, std_heartbeat_features,
+                          median_heartbeat_features, intervals, mean_heartbeat, std_heartbeat, hrv_features,
+                          np.mean(hr), np.std(hr), np.median(hr)])
 
     return features
 
-def create_features(X):
+def create_features(X, filename='Data/train_features.csv'):
     features = []
     for i in range(len(X)):
         signal = X.loc[i]
@@ -64,17 +150,77 @@ def create_features(X):
 
     features = np.array(features)
     features_df = pd.DataFrame(features)
-    features_df.to_csv('Data/test_features.csv', index=False)
+    features_df.to_csv(filename, index=False)
+
+def compute_hrv_features(rr_intervals):
+    # RMSSD
+    rmssd = np.sqrt(np.mean(np.square(np.diff(rr_intervals))))
+    # SDNN
+    sdnn = np.std(rr_intervals)
+    # PNN50
+    pnn50 = np.sum(np.diff(rr_intervals) > 0.05) / len(rr_intervals) * 100
+    return rmssd, sdnn, pnn50
+
+def extract_intervals_from_points(r_peaks, t_vals, q_vals, s_vals, sampling_rate):
+    t_vals = t_vals[~np.isnan(t_vals)]
+    q_vals = q_vals[~np.isnan(q_vals)]
+    s_vals = s_vals[~np.isnan(s_vals)]
+    min_length = min(len(q_vals), len(s_vals), len(t_vals))
+    q_vals = q_vals[:min_length]
+    s_vals = s_vals[:min_length]
+    t_vals = t_vals[:min_length]
+
+    rr_intervals = np.diff(r_peaks) / sampling_rate
+    mean_rr = np.nanmean(rr_intervals)
+    std_rr = np.std(rr_intervals)
+    median_rr = np.median(rr_intervals)
+
+    qrs_duration = (s_vals - q_vals) / sampling_rate
+    mean_qrs = np.nanmean(qrs_duration)
+    std_qrs = np.nanstd(qrs_duration)
+    median_qrs = np.nanmedian(qrs_duration)
+
+    qt_interval = (t_vals - q_vals) / sampling_rate
+    mean_qt = np.nanmean(qt_interval)
+    std_qt = np.nanstd(qt_interval)
+    median_qt = np.nanmedian(qt_interval)
+
+    qq_interval = np.diff(q_vals) / sampling_rate
+    mean_qq = np.nanmean(qq_interval)
+    std_qq = np.nanstd(qq_interval)
+    median_qq = np.nanmedian(qq_interval)
+
+    ss_interval = np.diff(s_vals) / sampling_rate
+    mean_ss = np.nanmean(ss_interval)
+    std_ss = np.nanstd(ss_interval)
+    median_ss = np.nanmedian(ss_interval)
+
+    tt_interval = np.diff(t_vals) / sampling_rate
+    mean_tt = np.nanmean(tt_interval)
+    std_tt = np.nanstd(tt_interval)
+    median_tt = np.nanmedian(tt_interval)
+
+    intervals = np.array([
+        mean_rr, std_rr, median_rr,
+        mean_qrs, std_qrs, median_qrs,
+        mean_qt, std_qt, median_qt,
+        mean_qq, std_qq, median_qq,
+        mean_ss, std_ss, median_ss,
+        mean_tt, std_tt, median_tt
+    ])
+
+    return intervals
 
 def extract_intervals_from_heartbeat(heartbeat, r_peaks, sampling_rate):
     # Calculate RR intervals
     rr_intervals = np.diff(r_peaks) / sampling_rate
     mean_rr = np.mean(rr_intervals)
     std_rr = np.std(rr_intervals)
+    r_wave_idx = np.argmax(heartbeat)
 
-    if not isinstance(heartbeat, np.ndarray) or heartbeat.size == 0:
-        print("Error: Heartbeat input is not a valid array or is empty.")
-        return np.array([mean_rr, std_rr, np.nan, np.nan, np.nan])
+    #if not isinstance(heartbeat, np.ndarray) or heartbeat.size == 0:
+    #    print("Error: Heartbeat input is not a valid array or is empty.")
+    #    return np.array([mean_rr, std_rr, np.nan, np.nan, np.nan])
 
     q_wave_idx = np.argmin(heartbeat[:len(heartbeat) // 2])
     s_wave_idx = len(heartbeat) // 2 + np.argmin(heartbeat[len(heartbeat) // 2:])
@@ -86,7 +232,7 @@ def extract_intervals_from_heartbeat(heartbeat, r_peaks, sampling_rate):
 
 
     intervals = np.array([
-        mean_rr, std_rr, qrs_duration, qt_interval, pr_interval
+        mean_rr, std_rr, qrs_duration, qt_interval, pr_interval, q_wave_idx, s_wave_idx, t_wave_end, r_wave_idx
     ])
 
     return intervals
@@ -147,6 +293,10 @@ def extract_frequency_features(signal, sampling_rate):
     # Total power
     total_power = np.trapz(psd, freqs)
 
+    mean_power = np.mean(psd)
+    std_power = np.std(psd)
+    median_power = np.median(psd)
+
     # Dominant frequency
     dominant_frequency = freqs[np.argmax(psd)]
 
@@ -170,8 +320,28 @@ def extract_frequency_features(signal, sampling_rate):
         lf_power, hf_power, total_power,
         dominant_frequency, lf_hf_ratio, spectral_entropy,
         spectral_centroid, spectral_bandwidth, spectral_rolloff,
-        spectral_flatness
+        spectral_flatness, mean_power, std_power, median_power
     ])
+
+def extract_wavelet_features(signal):
+    # Perform wavelet decomposition using 'db4' wavelet
+    coeffs = pywt.wavedec(signal, 'db4', level=5)
+
+    # Extract features from the coefficients
+    cA5, cD5, cD4, cD3, cD2, cD1 = coeffs
+    features = [
+        np.mean(cA5), np.std(cA5), np.sum(np.abs(cA5)),
+        np.mean(cD5), np.std(cD5), np.sum(np.abs(cD5)),
+        np.mean(cD4), np.std(cD4), np.sum(np.abs(cD4)),
+        np.mean(cD3), np.std(cD3), np.sum(np.abs(cD3))
+    ]
+    return np.array(features)
+
+
+def extract_nonlinear_features(signal):
+    sample_entropy = ant.sample_entropy(signal)
+    approximate_entropy = ant.app_entropy(signal)
+    return np.array([sample_entropy, approximate_entropy])
 
 def calculate_representative_heartbeats(templates):
     """
@@ -202,9 +372,6 @@ def extract_features_from_heartbeat(heartbeat, sampling_rate):
     Returns:
     - A 1D NumPy array containing the extracted features
     """
-    if not isinstance(heartbeat, np.ndarray) or heartbeat.size == 0:
-        print("Error: Heartbeat input is not a valid array or is empty.")
-        return np.array([np.nan] * 18)
 
     num_samples = len(heartbeat)
     # Step 1: Extract time-domain features
@@ -221,8 +388,12 @@ def extract_features_from_heartbeat(heartbeat, sampling_rate):
     # Step 2: Extract frequency-domain features using Welch's method
     freqs, psd = welch(heartbeat, fs=sampling_rate, nperseg=num_samples)
 
+    mean_power = np.mean(psd)
+    std_power = np.std(psd)
+    median_power = np.median(psd)
     spectral_entropy = entropy(psd)
     total_power = np.trapz(psd, freqs)
+    dominant_frequency = freqs[np.argmax(psd)]
     spectral_centroid = np.sum(freqs * psd) / np.sum(psd)
     # Spectral Bandwidth
     spectral_bandwidth = np.sqrt(np.sum(((freqs - spectral_centroid) ** 2) * psd) / np.sum(psd))
@@ -247,18 +418,20 @@ def extract_features_from_heartbeat(heartbeat, sampling_rate):
     # Calculate LF/HF ratio
     lf_hf_ratio = lf_power / (hf_power + 1e-12)
 
+
     # Combine all features into a single feature vector
     features = np.array([
         max_amplitude, min_amplitude, mean_value, std_value,
         median_value, energy, kurtosis_value, skewness, rms,
         lf_power, hf_power, lf_hf_ratio, spectral_entropy, total_power,
-        spectral_centroid, spectral_bandwidth, spectral_rolloff, spectral_flatness
+        spectral_centroid, spectral_bandwidth, spectral_rolloff, spectral_flatness, mean_power, std_power, median_power,
+        dominant_frequency
     ])
 
     return features
 
-def load_features():
-    return pd.read_csv('Data/train_features.csv')
+def load_features(filename='Data/train_features.csv'):
+    return pd.read_csv(filename).to_numpy()
 
 def load_labels():
     return pd.read_csv('Data/train_labels.csv').to_numpy().ravel()
@@ -284,15 +457,75 @@ def scale_features(features):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(features)
 
-    return X_scaled
+    return X_scaled, scaler
 
 def select_features(features, y):
     selector = Pipeline([
         ('threshold', VarianceThreshold(0.01)),
+        ('selector', SelectKBest(f_classif, k=452))
     ])
     X_new = selector.fit_transform(features, y)
 
-    return X_new
+    return X_new, selector
+
+
+def filter_correlated_features(X, correlation_threshold=0.9):
+    """
+    Removes features that are highly correlated with each other.
+
+    Parameters:
+    - X: 2D NumPy array (features)
+    - correlation_threshold: The threshold above which features are considered highly correlated (default is 0.9).
+
+    Returns:
+    - X_filtered: A 2D NumPy array with highly correlated features removed.
+    - to_drop: List of indices of the dropped features.
+    """
+    # Compute the correlation matrix
+    corr_matrix = np.corrcoef(X, rowvar=False)
+    corr_matrix = np.abs(corr_matrix)  # Use absolute values for correlations
+
+    # Get the indices of the upper triangle of the correlation matrix
+    upper_triangle = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+
+    # Identify features to drop based on the correlation threshold
+    to_drop = [col for col in range(corr_matrix.shape[1]) if
+               any(corr_matrix[col, upper_triangle[:, col]] > correlation_threshold)]
+
+    # Drop the highly correlated features
+    X_filtered = np.delete(X, to_drop, axis=1)
+
+    return X_filtered, to_drop
+
+def feature_selection_by_anova(X, y, p_value_threshold=0.05):
+    """
+    Perform feature selection using ANOVA F-test and remove features with p-values > 0.05.
+
+    Parameters:
+    - X: Feature matrix (NumPy array or DataFrame)
+    - y: Target vector (NumPy array or Series)
+    - p_value_threshold: The threshold for p-value (default is 0.05)
+
+    Returns:
+    - X_selected: Feature matrix with selected features
+    - selected_indices: List of indices of the selected features
+    """
+    # Perform ANOVA F-test
+
+    imputer = KNNImputer(n_neighbors=5)
+    X = imputer.fit_transform(X)
+
+    f_values, p_values = f_classif(X, y)
+
+    # Filter features based on p-value threshold
+    selected_indices = np.where(p_values <= p_value_threshold)[0]
+
+    # Select features with p-values <= threshold
+    X_selected = X[:, selected_indices]
+
+    print(f"Selected {len(selected_indices)} features out of {X.shape[1]}")
+
+    return X_selected, selected_indices
 
 def create_train_labels(y):
     y = pd.DataFrame(y)
@@ -321,27 +554,35 @@ def cross_validate_hist_grad_boost(X, y, n_splits=5):
         X_train, X_test = X[train_index], X[test_index]
         y_train, y_test = y[train_index], y[test_index]
 
+        imputer = KNNImputer(n_neighbors=5)
+        X_train = imputer.fit_transform(X_train)
+        X_test = imputer.transform(X_test)
+
         # Step 1: Scale features
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
+
+
         # Step 2: Feature selection
         selector = Pipeline([
-            ('threshold', VarianceThreshold(0.01)),
+            ('variance', VarianceThreshold(0.01)),
+            ('selector', SelectKBest(f_classif, k=452))
         ])
         X_train_selected = selector.fit_transform(X_train_scaled, y_train)
         X_test_selected = selector.transform(X_test_scaled)
 
+        # {'model__validation_fraction': 0.1, 'model__scoring': 'f1_weighted', 'model__min_samples_leaf': 40, 'model__max_leaf_nodes': 31, 'model__max_iter': 1000, 'model__max_depth': 9, 'model__max_bins': 128, 'model__learning_rate': 0.05, 'model__l2_regularization': 1.0, 'model__early_stopping': False}
         # Step 3: Train a Classifier
         model = HistGradientBoostingClassifier(learning_rate=0.15, max_depth=7, max_iter=350, max_leaf_nodes=30,
                                                l2_regularization=0.7, max_bins=140, early_stopping=False,
-                                               min_samples_leaf=30, random_state=42)
+                                               min_samples_leaf=30, random_state=42) # F1: 0.7874
+
         model.fit(X_train_selected, y_train)
 
         # Step 4: Make predictions on the validation set
         y_pred = model.predict(X_test_selected)
-
         # Step 5: Calculate evaluation metrics
         accuracy = accuracy_score(y_test, y_pred)
         precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
@@ -374,34 +615,36 @@ def tune_hist_gradient_boosting(X, y):
     # Define the model
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
-        ('selector', VarianceThreshold(0.01)),
+        ('variance', VarianceThreshold(0.01)),
+        ('selector', SelectKBest(f_classif, k=452)),
         ('model', HistGradientBoostingClassifier(random_state=42))
     ])
 
     # Define the parameter grid
-    param_distributions = {
-        'model__learning_rate': uniform(0.01, 0.3),
-        'model__max_iter': randint(100, 500),
-        'model__max_depth': [3, 5, 7, 9, None],
-        'model__min_samples_leaf': randint(1, 50),
-        'model__max_leaf_nodes': randint(10, 100),
-        'model__l2_regularization': uniform(0.0, 1.0),
-        'model__max_bins': randint(128, 256),
-        'model__early_stopping': [True, False]
+    param_distribution = {
+        'model__learning_rate': [0.01, 0.05, 0.1, 0.2, 0.3],  # Step size at each iteration
+        'model__max_iter': [100, 200, 300, 500, 1000],  # Number of boosting iterations
+        'model__max_depth': [3, 5, 7, 9, None],  # Depth of each tree
+        'model__min_samples_leaf': [10, 20, 30, 40, 50],  # Minimum samples required in a leaf
+        'model__max_leaf_nodes': [15, 31, 63, 127],  # Maximum leaves per tree
+        'model__l2_regularization': [0.0, 0.1, 0.5, 1.0],  # L2 regularization term
+        'model__max_bins': [128, 256, 512],  # Number of bins for continuous features
+        'model__early_stopping': [True, False],  # Early stopping to avoid overfitting
+        'model__validation_fraction': [0.1, 0.15, 0.2],  # Fraction of data for validation
+        'model__scoring': ['f1_weighted', 'accuracy', 'roc_auc']  # Scoring metric to optimize
     }
-
     # Define the cross-validation strategy
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     # Initialize RandomizedSearchCV
     search = RandomizedSearchCV(
         estimator=pipeline,
-        param_distributions=param_distributions,
-        n_iter=200,  # Number of parameter settings to try
+        param_distributions=param_distribution,
+        n_iter=50,  # Number of parameter settings to try
         scoring='f1_weighted',
         n_jobs=-1,  # Use all available processors
         cv=skf,
-        verbose=2,
+        verbose=3,
         random_state=42
     )
 
@@ -413,12 +656,18 @@ def tune_hist_gradient_boosting(X, y):
 
     return search.best_estimator_
 
-def create_submission_first(X, y, X_test):
+def create_submission(X, y, X_test):
     # Pre-process the data
-    X_scaled = scale_features(X)
-    X_test_scaled = scale_features(X_test)
-    X_selected = select_features(X_scaled, y)
-    X_test_selected = select_features(X_test_scaled, y)
+
+    imputer = KNNImputer(n_neighbors=5)
+    X = imputer.fit_transform(X)
+    X_test = imputer.transform(X_test)
+
+    X_scaled, scaler = scale_features(X)
+    X_test_scaled = scaler.transform(X_test)
+
+    X_selected, selector = select_features(X_scaled, y)
+    X_test_selected = selector.transform(X_test_scaled)
 
     # Train the model
     model = HistGradientBoostingClassifier(learning_rate=0.15, max_depth=7, max_iter=350, max_leaf_nodes=30,
@@ -431,17 +680,23 @@ def create_submission_first(X, y, X_test):
 
     # Create a submission file
     submission = pd.DataFrame({'id': np.arange(len(y_pred)), 'y': y_pred})
-    submission.to_csv('Data/submission.csv', index=False)
+    submission.to_csv('Data/submission2_ss.csv', index=False)
 
 if __name__ == "__main__":
-    x1, y, x2 = load_data()
 
-    create_features(x2)
-    #create_features(x1)
+    #x1, y, x2 = load_data()
+
+    #plot_ecg(x2, 2872)
+    #create_features(x1, filename='Data/train_features_with_ecg_feats.csv')
+    #create_features(x2, filename='Data/test_features_with_ecg_feats.csv')
     #create_train_labels(y)
 
-    #features = load_features()
-    #y = load_labels()
+    features = load_features(filename='Data/train_features_with_ecg_feats.csv')
+    #X_test = load_features(filename='Data/test_features_with_ecg_feats.csv')
+
+    y = load_labels()
+    #create_submission(features, y, X_test)
+    #feature_selection_by_anova(features, y)
     #features, y = remove_NaNs(features, y)
-    #cross_validate_hist_grad_boost(features, y, n_splits=5)
-    #tune_hist_gradient_boosting(features, y)
+    #cross_validate_hist_grad_boost(features, y, n_splits=10)
+    tune_hist_gradient_boosting(features, y)
