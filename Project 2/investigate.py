@@ -6,7 +6,7 @@ from scipy.stats import entropy, skew, kurtosis, uniform, randint
 import scipy
 from scipy.signal import welch
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.feature_selection import SelectKBest, f_classif, VarianceThreshold
+from sklearn.feature_selection import SelectKBest, f_classif, VarianceThreshold, mutual_info_classif
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
 from sklearn.naive_bayes import GaussianNB
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -15,9 +15,11 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
-from imblearn.over_sampling import BorderlineSMOTE
+from imblearn.over_sampling import BorderlineSMOTE, ADASYN, SMOTE
+from imblearn.combine import SMOTEENN
 from sklearn.impute import KNNImputer, SimpleImputer
 from scipy.signal import butter, filtfilt
+from sklearn.neural_network import MLPClassifier
 import antropy as ant
 import neurokit2 as nk
 import pywt
@@ -135,9 +137,11 @@ def extract_features(signal):
 
     hrv_features = compute_hrv_features(np.diff(rpeaks) / sampling_rate)
 
+    wavelet_features = extract_wavelet_features(signal)
+
     features = np.hstack([temporal_features, frequency_features, mean_heartbeat_features, std_heartbeat_features,
-                          median_heartbeat_features, intervals, mean_heartbeat, std_heartbeat, hrv_features,
-                          np.mean(hr), np.std(hr), np.median(hr)])
+                          median_heartbeat_features, intervals, mean_heartbeat, std_heartbeat, median_heartbeat, hrv_features,
+                          np.mean(hr), np.std(hr), np.median(hr), wavelet_features])
 
     return features
 
@@ -462,7 +466,7 @@ def scale_features(features):
 def select_features(features, y):
     selector = Pipeline([
         ('threshold', VarianceThreshold(0.01)),
-        ('selector', SelectKBest(f_classif, k=452))
+        ('selector', SelectKBest(f_classif, k=633))
     ])
     X_new = selector.fit_transform(features, y)
 
@@ -515,6 +519,9 @@ def feature_selection_by_anova(X, y, p_value_threshold=0.05):
     imputer = KNNImputer(n_neighbors=5)
     X = imputer.fit_transform(X)
 
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+
     f_values, p_values = f_classif(X, y)
 
     # Filter features based on p-value threshold
@@ -558,26 +565,31 @@ def cross_validate_hist_grad_boost(X, y, n_splits=5):
         X_train = imputer.fit_transform(X_train)
         X_test = imputer.transform(X_test)
 
+        #adasyn = ADASYN(random_state=42)
+        #X_train, y_train = adasyn.fit_resample(X_train, y_train)
+
+
         # Step 1: Scale features
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
 
-
         # Step 2: Feature selection
         selector = Pipeline([
             ('variance', VarianceThreshold(0.01)),
-            ('selector', SelectKBest(f_classif, k=452))
+            ('selector', SelectKBest(f_classif, k=633))
         ])
         X_train_selected = selector.fit_transform(X_train_scaled, y_train)
         X_test_selected = selector.transform(X_test_scaled)
 
-        # {'model__validation_fraction': 0.1, 'model__scoring': 'f1_weighted', 'model__min_samples_leaf': 40, 'model__max_leaf_nodes': 31, 'model__max_iter': 1000, 'model__max_depth': 9, 'model__max_bins': 128, 'model__learning_rate': 0.05, 'model__l2_regularization': 1.0, 'model__early_stopping': False}
+        # Best parameters found: {'model__validation_fraction': 0.15, 'model__scoring': 'f1_weighted', 'model__min_samples_leaf': 40, 'model__max_leaf_nodes': 63, 'model__max_iter': 1000, 'model__max_depth': 9, 'model__max_bins': 128, 'model__learning_rate': 0.01, 'model__l2_regularization': 0.0, 'model__early_stopping': False}
         # Step 3: Train a Classifier
         model = HistGradientBoostingClassifier(learning_rate=0.15, max_depth=7, max_iter=350, max_leaf_nodes=30,
                                                l2_regularization=0.7, max_bins=140, early_stopping=False,
-                                               min_samples_leaf=30, random_state=42) # F1: 0.7874
+                                               min_samples_leaf=30, random_state=42, class_weight="balanced") # F1: 0.818
+
+        #model = HistGradientBoostingClassifier(learning_rate=0.05, scoring='roc_auc', max_depth=9, max_iter=500, max_leaf_nodes=127, l2_regularization=0.5, max_bins=128, early_stopping=False, min_samples_leaf=40, random_state=42)
 
         model.fit(X_train_selected, y_train)
 
@@ -614,9 +626,10 @@ def tune_hist_gradient_boosting(X, y):
     """
     # Define the model
     pipeline = Pipeline([
+        ('imputer', KNNImputer(n_neighbors=5)),
         ('scaler', StandardScaler()),
         ('variance', VarianceThreshold(0.01)),
-        ('selector', SelectKBest(f_classif, k=452)),
+        #('selector', SelectKBest(f_classif, k=452)),
         ('model', HistGradientBoostingClassifier(random_state=42))
     ])
 
@@ -663,16 +676,19 @@ def create_submission(X, y, X_test):
     X = imputer.fit_transform(X)
     X_test = imputer.transform(X_test)
 
+    #adasyn = ADASYN(random_state=42)
+    #X, y = adasyn.fit_resample(X, y)
+
     X_scaled, scaler = scale_features(X)
     X_test_scaled = scaler.transform(X_test)
 
     X_selected, selector = select_features(X_scaled, y)
     X_test_selected = selector.transform(X_test_scaled)
 
-    # Train the model
+    # Train the model # lr = 0.15
     model = HistGradientBoostingClassifier(learning_rate=0.15, max_depth=7, max_iter=350, max_leaf_nodes=30,
                                            l2_regularization=0.7, max_bins=140, early_stopping=False,
-                                           min_samples_leaf=30, random_state=42)
+                                           min_samples_leaf=30, random_state=42, class_weight="balanced")
     model.fit(X_selected, y)
 
     # Make predictions
@@ -680,23 +696,26 @@ def create_submission(X, y, X_test):
 
     # Create a submission file
     submission = pd.DataFrame({'id': np.arange(len(y_pred)), 'y': y_pred})
-    submission.to_csv('Data/submission2_ss.csv', index=False)
+    submission.to_csv('Data/submission5_ss.csv', index=False)
 
 if __name__ == "__main__":
 
     #x1, y, x2 = load_data()
 
-    #plot_ecg(x2, 2872)
-    #create_features(x1, filename='Data/train_features_with_ecg_feats.csv')
-    #create_features(x2, filename='Data/test_features_with_ecg_feats.csv')
+    #plot_ecg(x2, 500)
+    #create_features(x1, filename='Data/train_features_ecg_feat_wavelet_median.csv')
+    #create_features(x2, filename='Data/test_features_ecg_feat_wavelet_median.csv')
     #create_train_labels(y)
 
-    features = load_features(filename='Data/train_features_with_ecg_feats.csv')
-    #X_test = load_features(filename='Data/test_features_with_ecg_feats.csv')
+    #
+    features = load_features(filename='Data/train_features_ecg_feat_wavelet_median.csv')
+    #
+    X_test = load_features(filename='Data/test_features_ecg_feat_wavelet_median.csv')
 
     y = load_labels()
-    #create_submission(features, y, X_test)
+    create_submission(features, y, X_test)
     #feature_selection_by_anova(features, y)
     #features, y = remove_NaNs(features, y)
     #cross_validate_hist_grad_boost(features, y, n_splits=10)
-    tune_hist_gradient_boosting(features, y)
+    #tune_hist_gradient_boosting(features, y) # Best parameters found: {'model__validation_fraction': 0.15, 'model__scoring': 'f1_weighted', 'model__min_samples_leaf': 40, 'model__max_leaf_nodes': 63, 'model__max_iter': 1000, 'model__max_depth': 9, 'model__max_bins': 128, 'model__learning_rate': 0.01, 'model__l2_regularization': 0.0, 'model__early_stopping': False}
+
